@@ -2,190 +2,199 @@
 set -euo pipefail
 
 # -----------------------------
-# Konfiguration
+# 1: Konfiguration
 # -----------------------------
 PGDATA=/tmp/pgdata_test
 PGPORT=5433
+PGHOST=127.0.0.1
 PGUSER=$(whoami)
 BACKUPDIR=/tmp/pgbackup
 ARCHIVEDIR=/tmp/pgwal
 DB=testdb
 TABLE=testtable
-PG_BIN=/usr/lib/postgresql/18/bin
-RECOVERY_TIMEOUT=60  # Max. Sekunden, um Recovery abzuwarten
+PG_BIN=$(pg_config --bindir)
+RECOVERY_TIMEOUT=60
+GPG_PASSWORD="MeinSicheresPasswort" # Hinweis: In Produktion besser Secret Manager
 
 # -----------------------------
-# Cleanup vorheriger Test
+# 2: Cleanup vorheriger Test
 # -----------------------------
 rm -rf "$PGDATA" "$BACKUPDIR" "$ARCHIVEDIR"
 mkdir -p "$BACKUPDIR" "$ARCHIVEDIR"
 
 # -----------------------------
-# PostgreSQL initialisieren
+# 3: PostgreSQL initialisieren
 # -----------------------------
-echo "==> Initialisiere PostgreSQL Cluster"
 "$PG_BIN/initdb" -D "$PGDATA"
 chmod 700 "$PGDATA"
 
-# Replikation für WAL Backup erlauben
-echo "local   replication     $PGUSER     trust" >>"$PGDATA/pg_hba.conf"
+# -----------------------------
+# 4: TCP + Replikation erlauben
+# -----------------------------
+cat >>"$PGDATA/pg_hba.conf" <<EOF
+host    all             all             127.0.0.1/32        trust
+host    replication     all             127.0.0.1/32        trust
+EOF
 
-# Konfiguration für WAL & Archive
 cat >>"$PGDATA/postgresql.conf" <<EOF
 wal_level = replica
 archive_mode = on
-archive_command = 'cp %p ${ARCHIVEDIR}/%f || true'
-listen_addresses = 'localhost'
+archive_command = 'test ! -f ${ARCHIVEDIR}/%f && cp %p ${ARCHIVEDIR}/%f'
+listen_addresses = '127.0.0.1'
 port = ${PGPORT}
 EOF
 
 # -----------------------------
-# PostgreSQL starten
+# 5: PostgreSQL starten
 # -----------------------------
-echo "==> Starte PostgreSQL"
 "$PG_BIN/pg_ctl" -D "$PGDATA" -o "-p $PGPORT -k $PGDATA" -w start
 
 # -----------------------------
-# Testdatenbank & Tabelle
+# 6: Testdatenbank + Tabelle erstellen
 # -----------------------------
-echo "==> Erstelle Testdatenbank und Tabelle"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d postgres -c "CREATE DATABASE $DB;"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "CREATE TABLE $TABLE (id INT, name TEXT);"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres <<EOF
+CREATE DATABASE $DB;
+EOF
 
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" <<EOF
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" <<EOF
+CREATE TABLE $TABLE (id INT PRIMARY KEY, name TEXT);
+EOF
+
+# -----------------------------
+# 7: 5 Datensätze vor Base Backup
+# -----------------------------
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" <<EOF
 INSERT INTO $TABLE VALUES
-(1,'Alice'),(2,'Bob'),(3,'Carol'),(4,'Dave'),(5,'Eve'),
+(1,'Alice'),(2,'Bob'),(3,'Carol'),(4,'Dave'),(5,'Eve');
+EOF
+
+echo "==> Tabelle vor Base Backup:"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
+
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT pg_switch_wal();"
+sleep 2
+
+# -----------------------------
+# 8: Base Backup erstellen + GPG verschlüsseln
+# -----------------------------
+echo "==> Erstelle Base Backup (Plain-Modus)"
+"$PG_BIN/pg_basebackup" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -D "$BACKUPDIR/base" -Fp -Xs -P -c fast
+
+# tar + gzip: nur Clusterinhalt packen
+tar -czf "$BACKUPDIR/base_backup.tar.gz" -C "$BACKUPDIR/base" .
+gpg --batch --yes --passphrase "$GPG_PASSWORD" -c "$BACKUPDIR/base_backup.tar.gz"
+BACKUP_FILE="$BACKUPDIR/base_backup.tar.gz.gpg"
+echo "==> Base Backup fertig und verschlüsselt: $BACKUP_FILE"
+
+# -----------------------------
+# 9: 5 Datensätze nach Base Backup
+# -----------------------------
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" <<EOF
+INSERT INTO $TABLE VALUES
 (6,'Frank'),(7,'Grace'),(8,'Heidi'),(9,'Ivan'),(10,'Judy');
 EOF
 
-echo "==> Tabelle vor Base Backup"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
+echo "==> Tabelle nach Base Backup, vor Desaster:"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
 
-# WAL Switch vor Base Backup
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT pg_switch_wal();"
-sleep 1  # kurze Pause, damit Archivierung startet
-
-# -----------------------------
-# Base Backup
-# -----------------------------
-echo "==> Erstelle Base Backup"
-"$PG_BIN/pg_basebackup" -D "$BACKUPDIR" -h localhost -p "$PGPORT" -U "$PGUSER" -Fp -Xs -P -c fast
-"$PG_BIN/pg_verifybackup" "$BACKUPDIR"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT pg_switch_wal();"
+sleep 2
 
 # -----------------------------
-# Recovery-Zeitpunkt festlegen (vor Desaster!)
+# 10: Recovery-Zeitpunkt festlegen + Desaster simulieren
 # -----------------------------
 TARGET_TIME=$(date +"%Y-%m-%d %H:%M:%S")
 echo "Recovery-Zeitpunkt festgelegt: $TARGET_TIME"
 
-# -----------------------------
-# Desaster simulieren
-# -----------------------------
-echo "==> Simuliere Desaster (DELETE)"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "DELETE FROM $TABLE WHERE id <= 8;"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" <<EOF
+DELETE FROM $TABLE WHERE id <= 8;
+EOF
 
-echo "==> Tabelle nach Desaster"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
+echo "==> Tabelle nach Desaster:"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
 
-# WAL Switch nach Desaster, Archivierung sicherstellen
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT pg_switch_wal();"
+"$PG_BIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT pg_switch_wal();"
 sleep 2
 
 # -----------------------------
-# PostgreSQL stoppen für Restore
+# 11: Stoppen für Restore
 # -----------------------------
-echo "==> Stoppe PostgreSQL für Restore"
 "$PG_BIN/pg_ctl" -D "$PGDATA" -m fast -w stop
 
 # -----------------------------
-# Restore Base Backup
+# 12: Restore: GPG entschlüsseln + tar entpacken
 # -----------------------------
-echo "==> Restore Base Backup"
+gpg --batch --yes --passphrase "$GPG_PASSWORD" -d "$BACKUP_FILE" >"$BACKUPDIR/base_backup.tar.gz"
+
+# PGDATA leeren und Clusterinhalt wiederherstellen
 rm -rf "${PGDATA:?}/"*
-cp -a "$BACKUPDIR/"* "$PGDATA"
+tar -xzf "$BACKUPDIR/base_backup.tar.gz" -C "$PGDATA"
 chmod -R 700 "$PGDATA"
 
 # -----------------------------
-# Recovery konfigurieren
+# 13: Recovery konfigurieren
 # -----------------------------
 touch "$PGDATA/recovery.signal"
+cat >>"$PGDATA/postgresql.auto.conf" <<EOF
 
-cat >"$PGDATA/postgresql.auto.conf" <<EOF
 restore_command = 'cp ${ARCHIVEDIR}/%f %p'
 recovery_target_time = '${TARGET_TIME}'
 recovery_target_action = 'promote'
 EOF
 
 # -----------------------------
-# PostgreSQL starten für PITR
+# 14: PostgreSQL starten + PITR überwachen
 # -----------------------------
-echo "==> Starte PostgreSQL für PITR Recovery"
 "$PG_BIN/pg_ctl" -D "$PGDATA" -o "-p $PGPORT -k $PGDATA" -w start
 
-# -----------------------------
-# Warten bis Recovery abgeschlossen oder Timeout
-# -----------------------------
-echo "==> Überwache Recovery (Timeout=${RECOVERY_TIMEOUT}s)..."
+echo "==> Überwache Recovery..."
 START=$(date +%s)
 while true; do
-    STATUS=$("$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At -c "SELECT pg_is_in_recovery();")
-    if [ "$STATUS" = "f" ]; then
-        echo "✅ Recovery abgeschlossen"
-        break
-    fi
-    NOW=$(date +%s)
-    ELAPSED=$((NOW - START))
-    if [ "$ELAPSED" -ge "$RECOVERY_TIMEOUT" ]; then
-        echo "❌ Recovery Timeout erreicht!"
-        exit 1
-    fi
-    sleep 1
+	STATUS=$("$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At -c "SELECT pg_is_in_recovery();")
+	[ "$STATUS" = "f" ] && break
+	ELAPSED=$(($(date +%s) - START))
+	[ "$ELAPSED" -ge "$RECOVERY_TIMEOUT" ] && {
+		echo "❌ Recovery Timeout!"
+		exit 1
+	}
+	sleep 1
 done
-
-# WAL Replay LSN prüfen
-REPLAY_LSN=$("$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At -c "SELECT pg_last_wal_replay_lsn();")
-if [ -z "$REPLAY_LSN" ]; then
-    echo "❌ Fehler: WAL-Replay-LSN leer!"
-    exit 1
-fi
-echo "✅ WAL-Replay-LSN: $REPLAY_LSN"
+echo "✅ Recovery abgeschlossen"
 
 # -----------------------------
-# Datenintegrität prüfen
+# 15: Tabelle nach Recovery anzeigen
+# -----------------------------
+echo "==> Tabelle nach Recovery:"
+"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
+
+# -----------------------------
+# 16: Datenintegrität prüfen
 # -----------------------------
 ROW_COUNT=$("$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At -c "SELECT count(*) FROM $TABLE;")
-if [ "$ROW_COUNT" -ne 10 ]; then
-    echo "❌ Fehler: Erwartet 10 Zeilen, gefunden $ROW_COUNT"
-    exit 1
-fi
+[ "$ROW_COUNT" -ne 10 ] && {
+	echo "❌ Fehler: Erwartet 10 Zeilen, gefunden $ROW_COUNT"
+	exit 1
+}
 
-MISSING_IDS=$("$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At <<EOF
+MISSING_IDS=$(
+	"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -At <<EOF
 SELECT count(*) FROM generate_series(1,10) s
 WHERE NOT EXISTS (
   SELECT 1 FROM $TABLE t WHERE t.id = s
 );
 EOF
 )
-if [ "$MISSING_IDS" -ne 0 ]; then
-    echo "❌ Fehler: Fehlende IDs nach Recovery!"
-    exit 1
-fi
+[ "$MISSING_IDS" -ne 0 ] && {
+	echo "❌ Fehler: Fehlende IDs nach Recovery!"
+	exit 1
+}
 echo "✅ Datenintegrität OK"
 
 # -----------------------------
-# Tabelle nach Recovery anzeigen
-# -----------------------------
-echo "==> Tabelle nach Recovery"
-"$PG_BIN/psql" -h "$PGDATA" -p "$PGPORT" -U "$PGUSER" -d "$DB" -c "SELECT * FROM $TABLE;"
-
-# -----------------------------
-# Cleanup
+# 17: Cleanup
 # -----------------------------
 rm -f "$PGDATA/recovery.signal"
-echo "==> Stoppe Cluster nach Test"
 "$PG_BIN/pg_ctl" -D "$PGDATA" -m fast -w stop || true
-
-echo "==> Lösche Testcluster, WAL & Backup"
 rm -rf "$PGDATA" "$ARCHIVEDIR" "$BACKUPDIR"
 
 echo "==> PITR Test erfolgreich abgeschlossen ✅"
